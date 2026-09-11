@@ -1,0 +1,56 @@
+name: Public skill screening
+run-name: Public skill screening ${{ inputs.request_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: Public GitHub skill repository or default-branch tree URL
+        type: string
+        required: false
+      self_test:
+        description: Test NVIDIA's public benign and malicious fixtures only
+        type: boolean
+        default: true
+      request_id:
+        description: Opaque client request ID
+        type: string
+        required: true
+permissions: {}
+concurrency:
+  group: public-skill-screening
+  cancel-in-progress: false
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Check adapter
+        run: python3 -B -m unittest -v test_remote_scan.py
+      - name: Build pinned NVIDIA scanner
+        run: docker build -t public-skill-scanner . > /tmp/scanner-build.log 2>&1
+      - name: Screen remotely and publish sanitized envelope
+        env:
+          PUBLIC_SKILL_URL: ${{ inputs.url }}
+          SELF_TEST: ${{ inputs.self_test }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          volume="skill-data-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker volume rm "$volume" >/dev/null 2>&1 || true' EXIT
+          common=(--rm --read-only --cap-drop=ALL --security-opt=no-new-privileges --memory=2g --cpus=2 --pids-limit=128 --ulimit fsize=16384:16384 --tmpfs /tmp:rw,noexec,nosuid,size=128m,mode=1777)
+          if [[ "$SELF_TEST" == "true" ]]; then
+            docker run "${common[@]}" --network=none public-skill-scanner self-test > /tmp/envelope.json 2>/dev/null || true
+          else
+            docker volume create "$volume" >/dev/null
+            docker run --rm --network=none --user=0:0 --cap-drop=ALL --cap-add=CHOWN --security-opt=no-new-privileges --entrypoint chown -v "$volume:/data" public-skill-scanner 65534:65534 /data
+            if timeout -k 10 100 docker run "${common[@]}" -v "$volume:/data" public-skill-scanner fetch "$PUBLIC_SKILL_URL" >/dev/null 2>&1; then
+              docker run "${common[@]}" --network=none -v "$volume:/data:ro" public-skill-scanner scan > /tmp/envelope.json 2>/dev/null || true
+            fi
+          fi
+          python3 -I -B remote_scan.py project /tmp/envelope.json > /tmp/sanitized.json
+          cat /tmp/sanitized.json
+          cat /tmp/sanitized.json >> "$GITHUB_STEP_SUMMARY"
+          python3 -c 'import json,os; d=json.load(open("/tmp/sanitized.json")); expected="SELF_TEST_PASS" if os.environ["SELF_TEST"]=="true" else "NO_STATIC_FINDINGS"; raise SystemExit(0 if d["reason"]==expected else 1)'
