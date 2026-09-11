@@ -13,7 +13,10 @@ SCANNER_COMMIT = "69dcdfb74487d361ba4c811d088cfdea2ff3a9dc"
 SCANNER_VERSION = "2.11.2"
 MAX_REPORT = 8 * 1024 * 1024
 STATUSES = {"ELIGIBLE_FOR_INSPIRATION_REVIEW", "REJECTED", "UNVERIFIED"}
-REASONS = {"NO_STATIC_FINDINGS", "SECURITY_FINDINGS", "INCOMPLETE_OR_FAILED", "INVALID_INPUT", "SELF_TEST_PASS", "SELF_TEST_FAIL"}
+REASONS = {"NO_STATIC_FINDINGS", "SECURITY_FINDINGS", "INCOMPLETE_OR_FAILED", "INVALID_INPUT", "SELF_TEST_PASS", "SELF_TEST_FAIL", "FETCH_FAILED"}
+STAGE = "NONE"
+STAGES = {"NONE", "INPUT", "CLONE", "REVISION", "PATH", "DIGEST", "RECEIPT"}
+FAILURES = {"NONE", "PERMISSION", "VALUE", "PROCESS", "TIMEOUT", "OS", "OTHER"}
 
 
 def target(value):
@@ -36,7 +39,8 @@ def base(status="UNVERIFIED", reason="INCOMPLETE_OR_FAILED"):
                 scanner_commit=SCANNER_COMMIT, scanner_version=SCANNER_VERSION,
                 scan_mode="STATIC_ONLY_OFFLINE", installation_authorized=False,
                 finding_count=0, component_count=0, complete=False,
-                candidate_commit=None, source_digest=None)
+                candidate_commit=None, source_digest=None,
+                failure_stage="NONE", failure_kind="NONE")
 
 
 def verdict(report):
@@ -69,7 +73,9 @@ def project(value):
     if (value.get("scanner_commit") != SCANNER_COMMIT or value.get("scanner_version") != SCANNER_VERSION
         or value.get("status") not in STATUSES or value.get("reason") not in REASONS
         or value.get("installation_authorized") is not False
-        or value.get("scan_mode") != result["scan_mode"]):
+        or value.get("scan_mode") != result["scan_mode"]
+        or value.get("failure_stage", "NONE") not in STAGES
+        or value.get("failure_kind", "NONE") not in FAILURES):
         return result
     for key in ("finding_count", "component_count"):
         if type(value.get(key)) is not int or not 0 <= value[key] <= 100000:
@@ -105,20 +111,26 @@ def git(directory, *args):
 
 def fetch(url):
     """Run only in the fresh remote container, with anonymous public access."""
+    global STAGE
+    STAGE = "INPUT"
     root_url, requested_ref, folder = target(url)
     from skillspector.input_handler import InputHandler
     handler = InputHandler()
     # NVIDIA performs its own bounded clone and path checks inside /data.
     tempfile.tempdir = "/data"
+    STAGE = "CLONE"
     root, kind = handler.resolve(root_url)
+    STAGE = "REVISION"
     commit = git(root, "rev-parse", "HEAD")
     branch = git(root, "symbolic-ref", "--short", "HEAD")
     if requested_ref and requested_ref not in {commit, branch, "HEAD"}:
         raise ValueError("INVALID_INPUT")
+    STAGE = "PATH"
     selected = root / folder
     if not selected.is_dir() or selected.is_symlink() or not selected.resolve().is_relative_to(root.resolve()):
         raise ValueError("INVALID_INPUT")
     # Preserve source provenance without returning source paths or text.
+    STAGE = "DIGEST"
     digest = hashlib.sha256()
     for file in sorted(selected.rglob("*")):
         if ".git" in file.relative_to(root).parts:
@@ -129,6 +141,7 @@ def fetch(url):
             name = file.relative_to(selected).as_posix().encode()
             digest.update(len(name).to_bytes(4, "big") + name)
             digest.update(hashlib.sha256(file.read_bytes()).digest())
+    STAGE = "RECEIPT"
     Path("/data/source.json").write_text(json.dumps(dict(path=str(selected), commit=commit, digest=digest.hexdigest())))
 
 
@@ -170,9 +183,15 @@ def main():
             result.update(candidate_commit=source["commit"], source_digest=source["digest"])
         print(json.dumps(project(result), sort_keys=True))
         return 0
-    except Exception:
-        if args.mode != "fetch":
-            print(json.dumps(base(), sort_keys=True))
+    except Exception as error:
+        result = base(reason="FETCH_FAILED" if args.mode == "fetch" else "INCOMPLETE_OR_FAILED")
+        if args.mode == "fetch":
+            result["failure_stage"] = STAGE
+            result["failure_kind"] = next((name for cls, name in (
+                (PermissionError, "PERMISSION"), (ValueError, "VALUE"),
+                (subprocess.TimeoutExpired, "TIMEOUT"), (subprocess.CalledProcessError, "PROCESS"),
+                (OSError, "OS")) if isinstance(error, cls)), "OTHER")
+        print(json.dumps(result, sort_keys=True))
         return 2
 
 

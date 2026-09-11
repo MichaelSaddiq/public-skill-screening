@@ -46,7 +46,7 @@ jobs:
           else
             docker volume create "$volume" >/dev/null
             docker run --rm --network=none --user=0:0 --cap-drop=ALL --cap-add=CHOWN --security-opt=no-new-privileges --entrypoint chown -v "$volume:/data" public-skill-scanner 65534:65534 /data
-            if timeout -k 10 100 docker run "${common[@]}" -v "$volume:/data" public-skill-scanner fetch "$PUBLIC_SKILL_URL" >/dev/null 2>&1; then
+            if timeout -k 10 100 docker run "${common[@]}" -v "$volume:/data" public-skill-scanner fetch "$PUBLIC_SKILL_URL" > /tmp/envelope.json 2>/dev/null; then
               docker run "${common[@]}" --network=none -v "$volume:/data:ro" public-skill-scanner scan > /tmp/envelope.json 2>/dev/null || true
             fi
           fi

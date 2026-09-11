@@ -55,7 +55,7 @@ class Checks(unittest.TestCase):
         self.assertEqual(project(result)["status"], "UNVERIFIED")
 
     def test_projection_invalid_types(self):
-        for key, val in (("finding_count", True), ("component_count", -1), ("complete", "true"), ("candidate_commit", "bad"), ("installation_authorized", True)):
+        for key, val in (("finding_count", True), ("component_count", -1), ("complete", "true"), ("candidate_commit", "bad"), ("installation_authorized", True), ("failure_kind", "RAW_PAYLOAD"), ("failure_stage", "RAW_PAYLOAD")):
             result = verdict(clean())
             result[key] = val
             self.assertEqual(project(result)["status"], "UNVERIFIED")
