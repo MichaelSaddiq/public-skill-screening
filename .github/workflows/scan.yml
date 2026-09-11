@@ -40,7 +40,10 @@ jobs:
           set -euo pipefail
           volume="skill-data-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           trap 'docker volume rm "$volume" >/dev/null 2>&1 || true' EXIT
-          common=(--rm --read-only --cap-drop=ALL --security-opt=no-new-privileges --memory=2g --cpus=2 --pids-limit=128 --ulimit fsize=16384:16384 --tmpfs /tmp:rw,noexec,nosuid,size=128m,mode=1777)
+          # Docker passes RLIMIT_FSIZE in bytes: 16 MiB, not shell ulimit blocks.
+          common=(--rm --read-only --cap-drop=ALL --security-opt=no-new-privileges --memory=2g --cpus=2 --pids-limit=128 --ulimit fsize=16777216:16777216 --tmpfs /tmp:rw,noexec,nosuid,size=128m,mode=1777)
+          # Synthetic offline probe: verify the actual cap and cross the old 16 KiB boundary.
+          docker run "${common[@]}" --network=none --entrypoint python public-skill-scanner -I -B -c 'import resource,tempfile; assert resource.getrlimit(resource.RLIMIT_FSIZE)==(16777216,16777216); f=tempfile.TemporaryFile(); assert f.write(bytes(16385))==16385; f.flush(); f.close()'
           if [[ "$SELF_TEST" == "true" ]]; then
             docker run "${common[@]}" --network=none public-skill-scanner self-test > /tmp/envelope.json 2>/dev/null || true
           else

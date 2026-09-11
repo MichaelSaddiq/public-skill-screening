@@ -1,6 +1,7 @@
 import copy
 import json
 import unittest
+from pathlib import Path
 from remote_scan import SCANNER_VERSION, base, project, target, verdict
 
 
@@ -12,6 +13,14 @@ def clean():
 
 
 class Checks(unittest.TestCase):
+    def test_workflow_file_limit_is_bytes_and_probed_offline(self):
+        workflow = (Path(__file__).parent / ".github/workflows/scan.yml").read_text()
+        self.assertIn("--ulimit fsize=16777216:16777216", workflow)
+        self.assertNotIn("--ulimit fsize=16384:16384", workflow)
+        self.assertIn("--network=none --entrypoint python", workflow)
+        self.assertIn("resource.getrlimit(resource.RLIMIT_FSIZE)==(16777216,16777216)", workflow)
+        self.assertIn("f.write(bytes(16385))", workflow)
+
     def test_benign(self):
         self.assertEqual(verdict(clean())["status"], "ELIGIBLE_FOR_INSPIRATION_REVIEW")
 
