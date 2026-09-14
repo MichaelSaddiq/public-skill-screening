@@ -8,6 +8,8 @@ import re
 import subprocess
 import sys
 import tempfile
+from urllib.request import Request, build_opener, ProxyHandler, HTTPRedirectHandler
+from urllib.parse import quote
 
 SCANNER_COMMIT = "69dcdfb74487d361ba4c811d088cfdea2ff3a9dc"
 SCANNER_VERSION = "2.11.2"
@@ -15,7 +17,7 @@ MAX_REPORT = 8 * 1024 * 1024
 STATUSES = {"ELIGIBLE_FOR_INSPIRATION_REVIEW", "REJECTED", "UNVERIFIED"}
 REASONS = {"NO_STATIC_FINDINGS", "SECURITY_FINDINGS", "INCOMPLETE_OR_FAILED", "INVALID_INPUT", "SELF_TEST_PASS", "SELF_TEST_FAIL", "FETCH_FAILED"}
 STAGE = "NONE"
-STAGES = {"NONE", "INPUT", "CLONE", "REVISION", "PATH", "DIGEST", "RECEIPT"}
+STAGES = {"NONE", "INPUT", "CLONE", "REVISION", "PATH", "DIGEST", "RECEIPT", "TREE", "BLOB"}
 FAILURES = {"NONE", "PERMISSION", "VALUE", "PROCESS", "TIMEOUT", "OS", "OTHER"}
 
 
@@ -109,31 +111,119 @@ def git(directory, *args):
     return subprocess.check_output(["git", "-C", str(directory), *args], stderr=subprocess.DEVNULL, timeout=20).decode().strip()
 
 
-def fetch(url):
-    """Run only in the fresh remote container, with anonymous public access."""
+MAX_FILE = 1024 * 1024  # NVIDIA's per-file analysis cap; no silent truncation.
+MAX_TOTAL = 100 * 1024 * 1024
+MAX_ENTRIES = 10000
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def read_public(url, limit):
+    if not (url.startswith("https://api.github.com/repos/") or
+            url.startswith("https://raw.githubusercontent.com/")):
+        raise ValueError("INVALID_INPUT")
+    opener = build_opener(ProxyHandler({}), NoRedirect())
+    request = Request(url, headers={"User-Agent": "public-skill-screening", "Accept-Encoding": "identity"})
+    with opener.open(request, timeout=15) as response:
+        if response.status != 200 or response.headers.get("Content-Encoding", "identity") != "identity":
+            raise ValueError("INCOMPLETE_OR_FAILED")
+        lengths = response.headers.get_all("Content-Length", [])
+        if len(lengths) > 1 or (lengths and (not lengths[0].isdigit() or int(lengths[0]) > limit)):
+            raise ValueError("INCOMPLETE_OR_FAILED")
+        data = response.read(limit + 1)
+        if len(data) > limit or (lengths and len(data) != int(lengths[0])):
+            raise ValueError("INCOMPLETE_OR_FAILED")
+        return data
+
+
+def object_sha(value):
+    if not isinstance(value, str) or not re.fullmatch("[0-9a-f]{40}", value):
+        raise ValueError("INVALID_INPUT")
+    return value
+
+
+def file_list(document):
+    if document.get("truncated") is not False or not isinstance(document.get("tree"), list):
+        raise ValueError("INCOMPLETE_OR_FAILED")
+    if len(document["tree"]) > MAX_ENTRIES:
+        raise ValueError("INCOMPLETE_OR_FAILED")
+    files, seen, total = [], set(), 0
+    for entry in document["tree"]:
+        name = entry.get("path")
+        if (not isinstance(name, str) or len(name) > 240 or
+                not re.fullmatch(r"[A-Za-z0-9_./-]+", name) or
+                any(p in {"", ".", "..", ".git"} for p in name.split("/")) or name in seen):
+            raise ValueError("INVALID_INPUT")
+        seen.add(name)
+        object_sha(entry.get("sha"))
+        if entry.get("type") == "tree" and entry.get("mode") == "040000":
+            continue
+        if entry.get("type") != "blob" or entry.get("mode") not in {"100644", "100755"}:
+            raise ValueError("INVALID_INPUT")
+        size = entry.get("size")
+        if type(size) is not int or not 0 <= size <= MAX_FILE:
+            raise ValueError("INCOMPLETE_OR_FAILED")
+        total += size
+        if total > MAX_TOTAL:
+            raise ValueError("INCOMPLETE_OR_FAILED")
+        files.append(entry)
+    if not files:
+        raise ValueError("INCOMPLETE_OR_FAILED")
+    return sorted(files, key=lambda e: e["path"])
+
+
+def fetch(url, data_root=Path("/data")):
+    """Fetch only a commit-pinned subtree in the disposable remote container."""
     global STAGE
     STAGE = "INPUT"
     root_url, requested_ref, folder = target(url)
-    from skillspector.input_handler import InputHandler
-    handler = InputHandler()
-    # NVIDIA performs its own bounded clone and path checks inside /data.
-    tempfile.tempdir = "/data"
-    STAGE = "CLONE"
-    root, kind = handler.resolve(root_url)
+    owner_repo = root_url.removeprefix("https://github.com/")
+    if owner_repo.split("/")[0].casefold() == "michaelsaddiq":
+        raise ValueError("INVALID_INPUT")
+    api = "https://api.github.com/repos/" + owner_repo
+    def metadata(suffix):
+        return json.loads(read_public(api + suffix, 2 * 1024 * 1024))
+    repo = metadata("")
+    if repo.get("private") is not False:
+        raise ValueError("INVALID_INPUT")
+    branch = repo["default_branch"]
     STAGE = "REVISION"
-    commit = git(root, "rev-parse", "HEAD")
-    branch = git(root, "symbolic-ref", "--short", "HEAD")
+    revision = metadata("/commits/" + quote(branch, safe=""))
+    commit = object_sha(revision["sha"])
     if requested_ref and requested_ref not in {commit, branch, "HEAD"}:
         raise ValueError("INVALID_INPUT")
-    STAGE = "PATH"
-    selected = root / folder
-    if not selected.is_dir() or selected.is_symlink() or not selected.resolve().is_relative_to(root.resolve()):
-        raise ValueError("INVALID_INPUT")
+    tree = object_sha(revision["commit"]["tree"]["sha"])
+    STAGE = "TREE"
+    for segment in folder.split("/") if folder else []:
+        listing = metadata("/git/trees/" + tree)
+        if listing.get("truncated") is not False:
+            raise ValueError("INCOMPLETE_OR_FAILED")
+        matches = [e for e in listing["tree"] if e.get("path") == segment and e.get("type") == "tree" and e.get("mode") == "040000"]
+        if len(matches) != 1:
+            raise ValueError("INVALID_INPUT")
+        tree = object_sha(matches[0]["sha"])
+    entries = file_list(metadata("/git/trees/" + tree + "?recursive=1"))
+    selected = data_root / "candidate"
+    selected.mkdir(exist_ok=False)
+    STAGE = "BLOB"
+    for entry in entries:
+        name = entry["path"]
+        rel = (folder + "/" if folder else "") + name
+        data = read_public("https://raw.githubusercontent.com/" + owner_repo + "/" + commit + "/" + quote(rel, safe="/"), MAX_FILE)
+        if len(data) != entry["size"] or hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest() != entry["sha"]:
+            raise ValueError("INCOMPLETE_OR_FAILED")
+        path = selected / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("xb") as output:
+            output.write(data)
     # Preserve source provenance without returning source paths or text.
     STAGE = "DIGEST"
     digest = hashlib.sha256()
     for file in sorted(selected.rglob("*")):
-        if ".git" in file.relative_to(root).parts:
+        if ".git" in file.relative_to(selected).parts:
             continue
         if file.is_symlink():
             raise ValueError("INVALID_INPUT")
@@ -142,7 +232,7 @@ def fetch(url):
             digest.update(len(name).to_bytes(4, "big") + name)
             digest.update(hashlib.sha256(file.read_bytes()).digest())
     STAGE = "RECEIPT"
-    Path("/data/source.json").write_text(json.dumps(dict(path=str(selected), commit=commit, digest=digest.hexdigest())))
+    (data_root / "source.json").write_text(json.dumps(dict(path=str(selected), commit=commit, digest=digest.hexdigest())))
 
 
 def scan(directory):

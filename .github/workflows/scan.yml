@@ -17,7 +17,9 @@ on:
         required: true
 permissions: {}
 concurrency:
-  group: public-skill-screening
+  # The client serializes normal submissions. Unique groups also prevent a race
+  # or manual dispatch from evicting an already pending request.
+  group: public-skill-screening-${{ github.run_id }}
   cancel-in-progress: false
 jobs:
   scan:
